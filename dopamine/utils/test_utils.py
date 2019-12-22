@@ -1,3 +1,4 @@
+# coding=utf-8
 # Copyright 2018 The Dopamine Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +21,7 @@ from __future__ import print_function
 
 
 import mock
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 class MockReplayBuffer(object):

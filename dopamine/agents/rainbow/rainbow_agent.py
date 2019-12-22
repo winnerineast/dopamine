@@ -1,3 +1,4 @@
+# coding=utf-8
 # Copyright 2018 The Dopamine Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,18 +37,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import collections
-
 
 
 from dopamine.agents.dqn import dqn_agent
+from dopamine.discrete_domains import atari_lib
 from dopamine.replay_memory import prioritized_replay_buffer
-import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 import gin.tf
-
-slim = tf.contrib.slim
 
 
 @gin.configurable
@@ -57,6 +54,10 @@ class RainbowAgent(dqn_agent.DQNAgent):
   def __init__(self,
                sess,
                num_actions,
+               observation_shape=dqn_agent.NATURE_DQN_OBSERVATION_SHAPE,
+               observation_dtype=dqn_agent.NATURE_DQN_DTYPE,
+               stack_size=dqn_agent.NATURE_DQN_STACK_SIZE,
+               network=atari_lib.RainbowNetwork,
                num_atoms=51,
                vmax=10.,
                gamma=0.99,
@@ -72,12 +73,24 @@ class RainbowAgent(dqn_agent.DQNAgent):
                tf_device='/cpu:*',
                use_staging=True,
                optimizer=tf.train.AdamOptimizer(
-                   learning_rate=0.00025, epsilon=0.0003125)):
+                   learning_rate=0.00025, epsilon=0.0003125),
+               summary_writer=None,
+               summary_writing_frequency=500):
     """Initializes the agent and constructs the components of its graph.
 
     Args:
       sess: `tf.Session`, for executing ops.
       num_actions: int, number of actions the agent can take at any state.
+      observation_shape: tuple of ints or an int. If single int, the observation
+        is assumed to be a 2D square.
+      observation_dtype: tf.DType, specifies the type of the observations. Note
+        that if your inputs are continuous, you should set this to tf.float32.
+      stack_size: int, number of frames to use in state stack.
+      network: tf.Keras.Model, expects four parameters:
+        (num_actions, num_atoms, support, network_type).  This class is used to
+        generate network instances that are used by the agent. Each
+        instantiation would have different set of variables. See
+        dopamine.discrete_domains.atari_lib.RainbowNetwork as an example.
       num_atoms: int, the number of buckets of the value function distribution.
       vmax: float, the value distribution support is [-vmax, vmax].
       gamma: float, discount factor with the usual RL meaning.
@@ -100,6 +113,10 @@ class RainbowAgent(dqn_agent.DQNAgent):
       use_staging: bool, when True use a staging area to prefetch the next
         training batch, speeding training up by about 30%.
       optimizer: `tf.train.Optimizer`, for training the value function.
+      summary_writer: SummaryWriter object for outputting training statistics.
+        Summary writing disabled if set to None.
+      summary_writing_frequency: int, frequency with which summaries will be
+        written. Lower values will result in slower training.
     """
     # We need this because some tools convert round floats into ints.
     vmax = float(vmax)
@@ -109,9 +126,14 @@ class RainbowAgent(dqn_agent.DQNAgent):
     # TODO(b/110897128): Make agent optimizer attribute private.
     self.optimizer = optimizer
 
-    super(RainbowAgent, self).__init__(
+    dqn_agent.DQNAgent.__init__(
+        self,
         sess=sess,
         num_actions=num_actions,
+        observation_shape=observation_shape,
+        observation_dtype=observation_dtype,
+        stack_size=stack_size,
+        network=network,
         gamma=gamma,
         update_horizon=update_horizon,
         min_replay_history=min_replay_history,
@@ -123,50 +145,22 @@ class RainbowAgent(dqn_agent.DQNAgent):
         epsilon_decay_period=epsilon_decay_period,
         tf_device=tf_device,
         use_staging=use_staging,
-        optimizer=self.optimizer)
+        optimizer=self.optimizer,
+        summary_writer=summary_writer,
+        summary_writing_frequency=summary_writing_frequency)
 
-  def _get_network_type(self):
-    """Returns the type of the outputs of a value distribution network.
-
-    Returns:
-      net_type: _network_type object defining the outputs of the network.
-    """
-    return collections.namedtuple('c51_network',
-                                  ['q_values', 'logits', 'probabilities'])
-
-  def _network_template(self, state):
+  def _create_network(self, name):
     """Builds a convolutional network that outputs Q-value distributions.
 
     Args:
-      state: `tf.Tensor`, contains the agent's current state.
-
+      name: str, this name is passed to the tf.keras.Model and used to create
+        variable scope under the hood by the tf.keras.Model.
     Returns:
-      net: _network_type object containing the tensors output by the network.
+      network: tf.keras.Model, the network instantiated by the Keras model.
     """
-    weights_initializer = slim.variance_scaling_initializer(
-        factor=1.0 / np.sqrt(3.0), mode='FAN_IN', uniform=True)
-
-    net = tf.cast(state, tf.float32)
-    net = tf.div(net, 255.)
-    net = slim.conv2d(
-        net, 32, [8, 8], stride=4, weights_initializer=weights_initializer)
-    net = slim.conv2d(
-        net, 64, [4, 4], stride=2, weights_initializer=weights_initializer)
-    net = slim.conv2d(
-        net, 64, [3, 3], stride=1, weights_initializer=weights_initializer)
-    net = slim.flatten(net)
-    net = slim.fully_connected(
-        net, 512, weights_initializer=weights_initializer)
-    net = slim.fully_connected(
-        net,
-        self.num_actions * self._num_atoms,
-        activation_fn=None,
-        weights_initializer=weights_initializer)
-
-    logits = tf.reshape(net, [-1, self.num_actions, self._num_atoms])
-    probabilities = tf.contrib.layers.softmax(logits)
-    q_values = tf.reduce_sum(self._support * probabilities, axis=2)
-    return self._get_network_type()(q_values, logits, probabilities)
+    network = self.network(self.num_actions, self._num_atoms, self._support,
+                           name=name)
+    return network
 
   def _build_replay_buffer(self, use_staging):
     """Creates the replay buffer used by the agent.
@@ -183,12 +177,15 @@ class RainbowAgent(dqn_agent.DQNAgent):
     """
     if self._replay_scheme not in ['uniform', 'prioritized']:
       raise ValueError('Invalid replay scheme: {}'.format(self._replay_scheme))
+    # Both replay schemes use the same data structure, but the 'uniform' scheme
+    # sets all priorities to the same value (which yields uniform sampling).
     return prioritized_replay_buffer.WrappedPrioritizedReplayBuffer(
-        observation_shape=dqn_agent.OBSERVATION_SHAPE,
-        stack_size=dqn_agent.STACK_SIZE,
+        observation_shape=self.observation_shape,
+        stack_size=self.stack_size,
         use_staging=use_staging,
         update_horizon=self.update_horizon,
-        gamma=self.gamma)
+        gamma=self.gamma,
+        observation_dtype=self.observation_dtype.as_numpy_dtype)
 
   def _build_target_distribution(self):
     """Builds the C51 target distribution as per Bellemare et al. (2017).
@@ -288,6 +285,9 @@ class RainbowAgent(dqn_agent.DQNAgent):
       update_priorities_op = tf.no_op()
 
     with tf.control_dependencies([update_priorities_op]):
+      if self.summary_writer is not None:
+        with tf.variable_scope('Losses'):
+          tf.summary.scalar('CrossEntropyLoss', tf.reduce_mean(loss))
       # Schaul et al. reports a slightly different rule, where 1/N is also
       # exponentiated by beta. Not doing so seems more reasonable, and did not
       # impact performance in our experiments.
@@ -317,8 +317,10 @@ class RainbowAgent(dqn_agent.DQNAgent):
         maximum ever seen [Schaul et al., 2015].
     """
     if priority is None:
-      priority = (1. if self._replay_scheme == 'uniform' else
-                  self._replay.memory.sum_tree.max_recorded_priority)
+      if self._replay_scheme == 'uniform':
+        priority = 1.
+      else:
+        priority = self._replay.memory.sum_tree.max_recorded_priority
 
     if not self.eval_mode:
       self._replay.add(last_observation, action, reward, is_terminal, priority)

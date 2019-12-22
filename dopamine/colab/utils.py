@@ -1,3 +1,4 @@
+# coding=utf-8
 # Copyright 2018 The Dopamine Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,7 +27,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 FILE_PREFIX = 'log'
 ITERATION_PREFIX = 'iteration_'
@@ -58,12 +59,12 @@ def load_baselines(base_dir, verbose=False):
   """
   experimental_data = {}
   for game in ALL_GAMES:
-    for agent in ['dqn', 'c51', 'rainbow', 'implicit_quantile']:
+    for agent in ['dqn', 'c51', 'rainbow', 'iqn']:
       game_data_file = os.path.join(base_dir, agent, '{}.pkl'.format(game))
       if not tf.gfile.Exists(game_data_file):
         if verbose:
           # pylint: disable=superfluous-parens
-          print('Unable to load data for agnet {} on game {}'.format(agent,
+          print('Unable to load data for agent {} on game {}'.format(agent,
                                                                      game))
           # pylint: enable=superfluous-parens
         continue
@@ -75,6 +76,16 @@ def load_baselines(base_dir, verbose=False):
         else:
           single_agent_data = pickle.load(f)
         single_agent_data['agent'] = agent
+        # The dataframe rows are all read as 'objects', which causes a
+        # ValueError when merging below. We cast the numerics to float64s to
+        # avoid this.
+        for field_name in single_agent_data.keys():
+          try:
+            single_agent_data[field_name] = (
+                single_agent_data[field_name].astype(np.float64))
+          except ValueError:
+            # This will catch any non-numerics that cannot be cast to float64.
+            continue
         if game in experimental_data:
           experimental_data[game] = experimental_data[game].merge(
               single_agent_data, how='outer')
@@ -166,7 +177,7 @@ def summarize_data(data, summary_keys):
 
   Example:
     data = load_statistics(...)
-    get_iteration_summmary(data, ['train_episode_returns',
+    summarize_data(data, ['train_episode_returns',
         'eval_episode_returns'])
 
   Returns:
@@ -266,7 +277,7 @@ def read_experiment(log_path,
         experiment_path, iteration_number=iteration_number, verbose=verbose)
 
     summary = summarize_data(raw_data, summary_keys)
-    for iteration in range(last_iteration):
+    for iteration in range(last_iteration + 1):
       # The row contains all the parameters, the iteration, and finally the
       # requested values.
       row_data = (list(parameter_tuple) + [iteration] +
@@ -274,6 +285,16 @@ def read_experiment(log_path,
       data_frame.loc[row_index] = row_data
 
       row_index += 1
+
+  # The dataframe rows are all read as 'objects', which causes a
+  # ValueError when merging below. We cast the numerics to float64s to
+  # avoid this.
+  for field_name in data_frame.keys():
+    try:
+      data_frame[field_name] = data_frame[field_name].astype(np.float64)
+    except ValueError:
+      # This will catch any non-numerics that cannot be cast to float64.
+      continue
 
   # Shed any unused rows.
   return data_frame.drop(np.arange(row_index, expected_num_rows))
